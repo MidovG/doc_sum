@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -33,11 +34,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-url", help="URL OpenAI-совместимого API или Ollama")
     p.add_argument("--api-key", help="API-ключ (лучше через переменную окружения)")
     p.add_argument("--lang", default="русский", help="язык саммари (по умолчанию русский)")
-    p.add_argument("--chunk-chars", type=int, default=12_000, help="размер фрагмента документа, символов")
-    p.add_argument("--context-chars", type=int, default=40_000,
-                   help="сколько символов саммари отправлять в один запрос при объединении")
+    p.add_argument("--chunk-chars", type=int, default=None,
+                   help="размер фрагмента документа, символов (по умолчанию 12000; для Ollama — по --num-ctx)")
+    p.add_argument("--context-chars", type=int, default=None,
+                   help="символов в одном запросе при объединении (по умолчанию 40000; для Ollama — по --num-ctx)")
+    p.add_argument("--num-ctx", type=int, default=None,
+                   help="Ollama: размер контекста модели в токенах (по умолчанию 16384 или OLLAMA_NUM_CTX)")
     p.add_argument("--doc-words", type=int, default=250, help="лимит слов на саммари одного документа")
-    p.add_argument("--workers", type=int, default=4, help="параллельных запросов к LLM")
+    p.add_argument("--workers", type=int, default=None,
+                   help="параллельных запросов к LLM (по умолчанию 4; для Ollama — 1)")
     p.add_argument("--max-tokens", type=int, default=2000, help="лимит токенов ответа модели")
     p.add_argument("--cache-dir", default=".docsum_cache", help="кэш загрузок и ответов LLM")
     p.add_argument("--no-cache", action="store_true", help="не кэшировать ответы LLM")
@@ -47,6 +52,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--version", action="version", version=f"docsum {__version__}")
     return p
+
+
+CHARS_PER_TOKEN = 2.5   # консервативно для кириллицы (у латиницы ~4)
+PROMPT_OVERHEAD = 600   # системный промпт + инструкции, токенов
+
+
+def sizes_for(provider: str, num_ctx: int, args) -> tuple[int, int, int]:
+    """Размер фрагмента, объём на объединение и число потоков.
+
+    Для облачных моделей контекст большой — берём фиксированные значения.
+    Для Ollama считаем от num_ctx: вход + ответ модели должны влезть в контекст,
+    иначе Ollama обрежет промпт.
+    """
+    if provider == "ollama":
+        budget = max(1000, num_ctx - args.max_tokens - PROMPT_OVERHEAD)
+        auto_context = int(budget * CHARS_PER_TOKEN)
+        auto_chunk = min(12_000, auto_context)
+        auto_workers = 1  # Ollama по умолчанию обрабатывает запросы к модели по очереди
+    else:
+        auto_context, auto_chunk, auto_workers = 40_000, 12_000, 4
+    return (args.chunk_chars or auto_chunk,
+            args.context_chars or auto_context,
+            args.workers or auto_workers)
 
 
 def render_markdown(res: Result, source: str, model: str) -> str:
@@ -99,7 +127,6 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         pass
 
-    import os
     provider = args.provider or os.getenv("DOCSUM_PROVIDER", "openai")
     model = args.model or os.getenv("DOCSUM_MODEL")
     cache = Path(args.cache_dir)
@@ -127,13 +154,24 @@ def main(argv: list[str] | None = None) -> int:
         log.error("В папке не найдено документов с текстом")
         return 1
 
+    num_ctx = args.num_ctx or int(os.getenv("OLLAMA_NUM_CTX", "16384"))
     llm = make_llm(provider, model, base_url=args.base_url, api_key=args.api_key,
-                   max_tokens=args.max_tokens,
+                   max_tokens=args.max_tokens, num_ctx=num_ctx if provider == "ollama" else None,
                    cache_dir=None if args.no_cache else cache / "llm")
-    log.info("LLM: %s / %s", llm.name, llm.model)
+    if hasattr(llm, "check"):
+        try:
+            llm.check()
+        except RuntimeError as e:
+            log.error("%s", e)
+            return 2
 
-    summarizer = Summarizer(llm, chunk_chars=args.chunk_chars, context_chars=args.context_chars,
-                            doc_words=args.doc_words, workers=args.workers, lang=args.lang)
+    chunk_chars, context_chars, workers = sizes_for(provider, num_ctx, args)
+    log.info("LLM: %s / %s · фрагмент %d симв. · объединение %d симв. · потоков %d%s",
+             llm.name, llm.model, chunk_chars, context_chars, workers,
+             f" · num_ctx {num_ctx}" if provider == "ollama" else "")
+
+    summarizer = Summarizer(llm, chunk_chars=chunk_chars, context_chars=context_chars,
+                            doc_words=args.doc_words, workers=workers, lang=args.lang)
     done = [0]
 
     def progress(s):
