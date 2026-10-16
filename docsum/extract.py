@@ -16,6 +16,18 @@ from typing import Callable, Iterator
 log = logging.getLogger(__name__)
 
 
+MAX_IMAGE_SIDE = 4000     # px; OCR нужно высокое разрешение, но гигантские фото ужимаем
+MIN_PAGE_TEXT = 30        # символов; страница PDF с меньшим текстом считается сканом
+MAX_IMAGE_PAGES = 100     # страниц-изображений на документ (защита от многочасовых прогонов)
+
+
+@dataclass
+class ImagePart:
+    """Изображение внутри документа, которое нужно распознать (PNG)."""
+    label: str
+    data: bytes
+
+
 @dataclass
 class Document:
     path: str            # путь относительно корня папки
@@ -23,10 +35,21 @@ class Document:
     text: str = ""
     error: str | None = None
     meta: dict = field(default_factory=dict)
+    # Части документа по порядку: текст или изображение. Изображения распознаются
+    # отдельным шагом (docsum.ocr), после чего text собирается заново.
+    parts: list[str | ImagePart] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.error is None and bool(self.text.strip())
+
+    @property
+    def images(self) -> list[ImagePart]:
+        return [p for p in self.parts if isinstance(p, ImagePart)]
+
+    @property
+    def pending_images(self) -> bool:
+        return self.error is None and bool(self.images)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,18 +94,67 @@ def _csv(data: bytes) -> str:
     return "\n".join(" | ".join(r) for r in rows)
 
 
-def _pdf(data: bytes) -> str:
+def _pdf(data: bytes) -> list[str | ImagePart]:
+    """Текстовые страницы — как текст; страницы-сканы — рендерятся в PNG для распознавания."""
     import pymupdf as fitz
 
-    parts = []
+    parts: list[str | ImagePart] = []
+    scanned = 0
     with fitz.open(stream=data, filetype="pdf") as doc:
         for i, page in enumerate(doc, 1):
             t = page.get_text("text").strip()
+            if len(t) >= MIN_PAGE_TEXT:
+                parts.append(f"[стр. {i}]\n{t}")
+                continue
+            if not page.get_images(full=False):
+                if t:
+                    parts.append(f"[стр. {i}]\n{t}")
+                continue                      # пустая страница
+            scanned += 1
+            if scanned > MAX_IMAGE_PAGES:
+                parts.append(f"[стр. {i}: не распознавалась — лимит {MAX_IMAGE_PAGES} страниц-сканов]")
+                continue
+            zoom = min(300 / 72, MAX_IMAGE_SIDE / max(page.rect.width, page.rect.height))  # 300 dpi
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             if t:
                 parts.append(f"[стр. {i}]\n{t}")
+            parts.append(ImagePart(f"стр. {i}", pix.tobytes("png")))
     if not parts:
-        raise ValueError("в PDF нет текстового слоя (скан) — нужен OCR")
-    return "\n\n".join(parts)
+        raise ValueError("PDF пустой")
+    return parts
+
+
+def _image(data: bytes) -> list[ImagePart]:
+    """Картинка → PNG (с учётом EXIF-поворота, уменьшением). Многостраничный TIFF — по кадрам."""
+    from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
+
+    parts = []
+    try:
+        im = Image.open(io.BytesIO(data))
+    except UnidentifiedImageError:
+        raise ValueError("не удалось открыть изображение: файл повреждён или формат не поддерживается") from None
+    with im:
+        frames = list(ImageSequence.Iterator(im)) if im.format == "TIFF" else [im]
+        for n, frame in enumerate(frames[:MAX_IMAGE_PAGES], 1):
+            parts.append(ImagePart(f"стр. {n}" if len(frames) > 1 else "изображение",
+                                   _to_png(ImageOps.exif_transpose(frame))))
+    return parts
+
+
+def _to_png(im) -> bytes:
+    from PIL import Image
+
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, "white")
+        bg.paste(im, mask=im.split()[-1])
+        im = bg
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    im.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+    buf = io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
 
 
 def _docx(data: bytes) -> str:
@@ -178,13 +250,14 @@ EXTRACTORS: dict[str, Callable[[bytes], str]] = {
     "pptx": _pptx,
     "rtf": _rtf,
     "eml": _eml,
+    **dict.fromkeys(["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"], _image),
 }
 
 UNSUPPORTED_HINT = {
     "doc": "старый формат Word — сохраните как .docx",
     "xls": "старый формат Excel — сохраните как .xlsx",
     "ppt": "старый формат PowerPoint — сохраните как .pptx",
-    **dict.fromkeys(["png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"], "изображение — нужен OCR"),
+    **dict.fromkeys(["heic", "heif"], "формат HEIC — сохраните как JPG"),
 }
 
 MAX_ZIP_DEPTH = 2
@@ -211,9 +284,14 @@ def extract_bytes(name: str, data: bytes, depth: int = 0) -> Iterator[Document]:
         yield Document(name, ext or "?", error=UNSUPPORTED_HINT.get(ext, "формат не поддерживается"))
         return
     try:
-        text = _normalize(fn(data))
-        doc = Document(name, ext, text=text, meta={"chars": len(text)})
-        if not text.strip():
+        result = fn(data)
+        parts = result if isinstance(result, list) else [result]
+        doc = Document(name, ext, parts=parts)
+        doc.text = normalize("\n\n".join(p for p in parts if isinstance(p, str)))
+        doc.meta["chars"] = len(doc.text)
+        if doc.images:
+            doc.meta["images"] = len(doc.images)
+        elif not doc.text.strip():
             doc.error = "текст не найден"
         yield doc
     except Exception as e:  # noqa: BLE001 — один плохой файл не должен ронять весь прогон
@@ -226,7 +304,7 @@ def _is_junk(name: str) -> bool:
     return base.startswith(("~$", ".")) or "__MACOSX" in name or base in {"Thumbs.db", "desktop.ini"}
 
 
-def _normalize(text: str) -> str:
+def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .extract import load_folder
+from .ocr import OCRUnavailable, TesseractOCR, recognize, skip_images
 from .llm import DEFAULT_MODELS, PROVIDERS, make_llm
 from .sources import resolve_source
 from .summarize import Result, Summarizer
@@ -43,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--doc-words", type=int, default=250, help="лимит слов на саммари одного документа")
     p.add_argument("--workers", type=int, default=None,
                    help="параллельных запросов к LLM (по умолчанию 4; для Ollama — 1)")
+    p.add_argument("--ocr-lang", default="rus+eng",
+                   help="языки Tesseract OCR для изображений и сканов (по умолчанию rus+eng)")
+    p.add_argument("--no-ocr", action="store_true", help="не распознавать изображения и сканы PDF")
     p.add_argument("--max-tokens", type=int, default=2000, help="лимит токенов ответа модели")
     p.add_argument("--cache-dir", default=".docsum_cache", help="кэш загрузок и ответов LLM")
     p.add_argument("--no-cache", action="store_true", help="не кэшировать ответы LLM")
@@ -95,7 +99,14 @@ def render_markdown(res: Result, source: str, model: str) -> str:
     for d in res.documents:
         lines.append(f"## {d.doc.path}")
         chars = f"{d.doc.meta.get('chars', 0):,}".replace(",", " ")
-        lines.append(f"_{d.doc.kind} · {chars} символов · фрагментов: {d.chunks}_")
+        extra = ""
+        if d.doc.meta.get("ocr"):
+            conf = d.doc.meta.get("ocr_confidence")
+            extra = (f" · OCR: {d.doc.meta['ocr_pages']} изобр."
+                     + (f", уверенность {conf}%" if conf is not None else ""))
+        if d.doc.meta.get("images_skipped"):
+            extra += f" · страниц-сканов пропущено: {d.doc.meta['images_skipped']}"
+        lines.append(f"_{d.doc.kind} · {chars} символов · фрагментов: {d.chunks}{extra}_")
         lines.append("")
         lines.append(f"> Ошибка: {d.error}" if d.error else d.summary.strip())
         lines.append("")
@@ -139,18 +150,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     docs = load_folder(root)
-    ok = [d for d in docs if d.ok]
-    log.info("Файлов: %d, с текстом: %d, всего символов: %s",
-             len(docs), len(ok), f"{sum(len(d.text) for d in ok):,}".replace(",", " "))
+    pending = [d for d in docs if d.pending_images]
     for d in docs:
-        if not d.ok:
+        if d.error:
             log.warning("Пропуск %s: %s", d.path, d.error)
 
     if args.extract_only:
-        for d in ok:
-            print(f"{d.path}\t{d.kind}\t{len(d.text)}")
+        for d in docs:
+            if d.ok or d.pending_images:
+                imgs = f"\tизображений: {len(d.images)}" if d.images else ""
+                print(f"{d.path}\t{d.kind}\t{len(d.text)}{imgs}")
         return 0
-    if not ok:
+    if not any(d.ok or d.pending_images for d in docs):
         log.error("В папке не найдено документов с текстом")
         return 1
 
@@ -166,6 +177,33 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     chunk_chars, context_chars, workers = sizes_for(provider, num_ctx, args)
+
+    # --- изображения и страницы-сканы: Tesseract OCR до саммари ---
+    if pending:
+        n_img = sum(len(d.images) for d in pending)
+        ocr, reason = None, "OCR выключен (--no-ocr)"
+        if not args.no_ocr:
+            try:
+                ocr = TesseractOCR(args.ocr_lang)
+            except OCRUnavailable as e:
+                reason = f"нужен OCR — {e}"
+        if ocr is None:
+            log.warning("Изображений: %d — пропускаю: %s", n_img, reason)
+            skip_images(docs, reason)
+        else:
+            log.info("OCR: %d изображений в %d файлах · %s", n_img, len(pending), ocr.name)
+            recognize(docs, ocr, workers=os.cpu_count() or 2,
+                      progress=lambda i, n: log.info("  OCR %d/%d", i, n))
+            for d in pending:
+                if d.error:
+                    log.warning("Пропуск %s: %s", d.path, d.error)
+
+    ok = [d for d in docs if d.ok]
+    log.info("Файлов: %d, с текстом: %d, всего символов: %s",
+             len(docs), len(ok), f"{sum(len(d.text) for d in ok):,}".replace(",", " "))
+    if not ok:
+        log.error("В папке не найдено документов с текстом")
+        return 1
     log.info("LLM: %s / %s · фрагмент %d симв. · объединение %d симв. · потоков %d%s",
              llm.name, llm.model, chunk_chars, context_chars, workers,
              f" · num_ctx {num_ctx}" if provider == "ollama" else "")
@@ -192,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
             "model": f"{llm.name}/{llm.model}",
             "overall": res.overall,
             "documents": [{"path": d.doc.path, "kind": d.doc.kind, "chars": len(d.doc.text),
-                           "chunks": d.chunks, "summary": d.summary, "error": d.error}
+                           "chunks": d.chunks, "summary": d.summary, "error": d.error,
+                           "ocr": d.doc.meta.get("ocr"),
+                           "ocr_confidence": d.doc.meta.get("ocr_confidence")}
                           for d in res.documents],
             "skipped": [{"path": d.path, "reason": d.error} for d in res.skipped],
         }, ensure_ascii=False, indent=2), encoding="utf-8")

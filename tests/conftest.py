@@ -46,6 +46,23 @@ def sample_folder(tmp_path: Path) -> Path:
         zf.writestr("__MACOSX/._junk", "x")
     (root / "archive.zip").write_bytes(buf.getvalue())
 
-    (root / "photo.png").write_bytes(b"\x89PNG\r\n")
+    make_text_image("INVOICE 42 TOTAL 1000").save(root / "photo.png")
+    (root / "broken.jpg").write_bytes(b"\xff\xd8 not really a jpeg")
+
+    scan = fitz.open()                          # PDF без текстового слоя — «скан»
+    page = scan.new_page()
+    buf = io.BytesIO()
+    make_text_image("SCANNED SERVICE CONTRACT", size=(1100, 200)).save(buf, "PNG")
+    page.insert_image(page.rect, stream=buf.getvalue())
+    scan.save(root / "sub" / "scan.pdf")
     (root / "~$lock.docx").write_bytes(b"junk")
     return root
+
+
+def make_text_image(text: str, size=(900, 200)):
+    """Белая картинка с крупным чёрным текстом — пригодна и для vision, и для OCR."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    im = Image.new("RGB", size, "white")
+    ImageDraw.Draw(im).text((30, 60), text, fill="black", font=ImageFont.load_default(size=56))
+    return im
